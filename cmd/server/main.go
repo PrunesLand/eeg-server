@@ -8,11 +8,17 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/PrunesLand/eeg-server.git/internal/api"
 	"github.com/PrunesLand/eeg-server.git/internal/serial"
+	"github.com/PrunesLand/eeg-server.git/internal/settings"
 )
 
 func main() {
 	fmt.Println("🧠 EEG Server Starting...")
+
+	// 0. Initialize Settings & API
+	appSettings := settings.New()
+	go api.StartServer(appSettings)
 
 	// 1. List Ports
 	ports, err := serial.ListPorts()
@@ -86,6 +92,14 @@ func main() {
 				continue
 			}
 
+			// Get current gain dynamically
+			currentGain := appSettings.GetGain()
+			// Constant Scale Factor = Vref / (2^24)
+			// Voltage = (Raw * Scale) / Gain
+			const vRef = 5.0
+			const maxADC = 16777216.0 // 2^24
+			scale := vRef / maxADC
+
 			// Parse 8 channels
 			fmt.Print("RX: ")
 			for ch := 0; ch < 8; ch++ {
@@ -107,7 +121,11 @@ func main() {
 				// Convert to signed int in Go
 				valSigned := int32(val32)
 
-				fmt.Printf("[%d]: %8d  ", ch+1, valSigned)
+				// Apply Conversion Formula
+				// volts = (raw * 5.0) / (2^24 * gain)
+				volts := (float64(valSigned) * scale) / currentGain
+
+				fmt.Printf("[%d]: %10.6f V  ", ch+1, volts)
 			}
 			fmt.Println()
 		}

@@ -36,7 +36,12 @@ func main() {
 	// For "one-shot" allow testing, let's pick the first one automatically or use a hardcoded default if preferred.
 	// But let's ask user to confirm if we want to be fancy. For now, simple: use the first one.
 	selectedPort := serial.FindPreferredPort(ports)
-	if selectedPort == "" {
+
+	// Check for manual override
+	if len(os.Args) > 1 && os.Args[1] == "mock" {
+		fmt.Println("⚠️ Manual override: Switching to MOCK MODE.")
+		selectedPort = serial.PortMock
+	} else if selectedPort == "" {
 		fmt.Println("⚠️ No 'usbmodem' or 'usbserial' found. Switching to MOCK MODE.")
 		selectedPort = serial.PortMock
 	} else {
@@ -68,10 +73,43 @@ func main() {
 	// 3. Read Data
 	fmt.Println("Listening for data... (Press Ctrl+C to stop)")
 
-	// Create a hex dumper for visualization
+	// Create a parser
 	go func() {
 		for packet := range device.DataStream {
-			fmt.Printf("RX (%d bytes): % X\n", len(packet), packet)
+			if len(packet) != 25 {
+				log.Printf("⚠️ Invalid packet length: %d", len(packet))
+				continue
+			}
+
+			if packet[0] != 'A' {
+				log.Printf("⚠️ Invalid header: %02x", packet[0])
+				continue
+			}
+
+			// Parse 8 channels
+			fmt.Print("RX: ")
+			for ch := 0; ch < 8; ch++ {
+				// 3 bytes per channel (Big Endian)
+				start := 1 + (ch * 3)
+				b0 := packet[start]
+				b1 := packet[start+1]
+				b2 := packet[start+2]
+
+				// Reassemble 24-bit Int
+				// uint32 first to shift
+				val32 := uint32(b0)<<16 | uint32(b1)<<8 | uint32(b2)
+
+				// Sign extension for 24-bit to 32-bit
+				if val32&0x800000 != 0 {
+					val32 |= 0xFF000000
+				}
+
+				// Convert to signed int in Go
+				valSigned := int32(val32)
+
+				fmt.Printf("[%d]: %8d  ", ch+1, valSigned)
+			}
+			fmt.Println()
 		}
 		fmt.Println("Data stream closed.")
 	}()

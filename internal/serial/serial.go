@@ -61,7 +61,7 @@ func (d *Device) Start(ctx context.Context) error {
 	return nil
 }
 
-// readLoop handles the continuous reading of bytes.
+// readLoop handles the continuous reading of bytes and framing packets.
 func (d *Device) readLoop(ctx context.Context, port serial.Port) {
 	// Ensure we close the port and the channel when this loop exits
 	defer port.Close()
@@ -69,43 +69,60 @@ func (d *Device) readLoop(ctx context.Context, port serial.Port) {
 
 	log.Printf("🔌 Serial Connected: %s @ %d baud", d.PortName, d.BaudRate)
 
-	// Create a temporary buffer to hold incoming data
-	readBuf := make([]byte, 4096)
+	// Buffer for raw reads
+	readBuf := make([]byte, 1024)
+	// Accumulator for building a full packet
+	var packetBuf []byte
 
 	for {
-		// Check if we have been told to stop (e.g. CTRL+C)
+		// Check cancellation
 		select {
 		case <-ctx.Done():
 			log.Println("🔌 Stopping Serial Reader...")
 			return
 		default:
-			// No stop signal, keep reading
 		}
 
-		// 3. Read from Hardware
-		// This blocks until data arrives or an error occurs
+		// Read raw bytes
 		n, err := port.Read(readBuf)
 		if err != nil {
 			log.Printf("❌ Serial Read Error: %v", err)
-			return // Exit loop on fatal error (connection lost)
+			return
 		}
 
 		if n > 0 {
-			// 4. Safe Data Copy (CRITICAL STEP)
-			// We cannot pass 'readBuf' directly because it will be overwritten
-			// by the next loop iteration before the DSP engine finishes using it.
-			// We must make a copy of exactly the bytes we received.
-			packet := make([]byte, n)
-			copy(packet, readBuf[:n])
+			// Append new bytes to accumulator
+			packetBuf = append(packetBuf, readBuf[:n]...)
 
-			// 5. Send to DSP via Channel
-			select {
-			case d.DataStream <- packet:
-				// Successfully sent
-			default:
-				// Channel is full! DSP is too slow or crashed.
-				// We drop the packet to prevent the Serial reader from freezing.
-				log.Println("⚠️ Warning: DSP buffer full, dropping packet")
+			// Process accumulator for valid packets
+			// Protocol: 25 bytes total. Byte 0 is 'A' (0x41).
+			for len(packetBuf) >= 25 {
+				// Find start byte 'A'
+				if packetBuf[0] != 'A' {
+					// Discard byte (slide window) until we find 'A' or run out
+					packetBuf = packetBuf[1:]
+					continue
+				}
+
+				// We have 'A' at index 0. Check if we have enough bytes for a full frame.
+				if len(packetBuf) < 25 {
+					// Not enough yet, wait for more data
+					break
+				}
+
+				// Full packet found! Extract 25 bytes.
+				fullPacket := make([]byte, 25)
+				copy(fullPacket, packetBuf[:25])
+
+				// Advance accumulator
+				packetBuf = packetBuf[25:]
+
+				// Send to DSP
+				select {
+				case d.DataStream <- fullPacket:
+				default:
+					log.Println("⚠️ Warning: DSP buffer full, dropping packet")
+				}
 			}
 		}
 	}
@@ -126,13 +143,26 @@ func (d *Device) mockLoop(ctx context.Context) {
 			log.Println("🔮 Stopping Mock Reader...")
 			return
 		case <-ticker.C:
-			// Generate a fake packet (just a sine wave for demo)
-			// Let's pretend we have 8 channels of 3 bytes (24-bit) + header
-			// For simplicity: just generating 32 bytes of "noise" + signal
-			packet := make([]byte, 32)
-			val := byte(127 + 127*math.Sin(t))
-			for i := range packet {
-				packet[i] = val
+			// Frame: [ 'A' ] [ 3-byte Ch1 ] [ 3-byte Ch2 ] ... [ 3-byte Ch8 ]
+			// Total 1 + 24 = 25 bytes.
+			// Format: Big Endian Signed 24-bit.
+			packet := make([]byte, 25)
+			packet[0] = 'A'
+
+			// Generate 8 channels of data
+			// We'll vary phases/frequencies slightly so channels look different
+			for ch := 0; ch < 8; ch++ {
+				// Sine wave: amplitude ~8 million (full 24-bit range is +/- 8.3M)
+				// Offset phases by channel index to look cool
+				valFloat := 8000000 * math.Sin(t+float64(ch))
+				valInt := int32(valFloat)
+
+				// Encode 24-bit Big Endian
+				// B0 is MSB, B2 is LSB
+				startIndex := 1 + (ch * 3)
+				packet[startIndex] = byte((valInt >> 16) & 0xFF)
+				packet[startIndex+1] = byte((valInt >> 8) & 0xFF)
+				packet[startIndex+2] = byte(valInt & 0xFF)
 			}
 			t += 0.1
 
